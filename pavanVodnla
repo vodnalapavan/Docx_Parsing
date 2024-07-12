@@ -1,0 +1,128 @@
+
+from flask import Flask, request, jsonify
+import psycopg2
+import boto3
+from werkzeug.utils import secure_filename
+import os
+from docx import Document
+
+app = Flask(__name__)
+
+# Configure PostgreSQL
+db_config = {
+    'dbname': 'your_dbname',
+    'user': 'your_dbuser',
+    'password': 'your_dbpassword',
+    'host': 'your_dbhost',
+    'port': 'your_dbport'
+}
+
+# Configure AWS S3
+s3 = boto3.client('s3',
+                  aws_access_key_id='your_aws_access_key_id',
+                  aws_secret_access_key='your_aws_secret_access_key',
+                  region_name='your_aws_region')
+bucket_name = 'your_s3_bucket_name'
+
+# Define upload folder
+UPLOAD_FOLDER = 'uploads/'
+app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+
+@app.route('/upload', methods=['POST'])
+def upload_file():
+    if 'file' not in request.files:
+        return jsonify({'error': 'No file part'}), 400
+
+    file = request.files['file']
+
+    if file.filename == '':
+        return jsonify({'error': 'No selected file'}), 400
+
+    if not file.filename.endswith('.docx'):
+        return jsonify({'error': 'Unsupported file type'}), 400
+
+    try:
+        # Save file locally
+        filename = secure_filename(file.filename)
+        file_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+        file.save(file_path)
+
+        # Parse .docx file
+        parsed_data = parse_docx(file_path)
+
+        # Save parsed data to PostgreSQL
+        save_to_postgres(parsed_data)
+
+        # Upload additional documents to S3
+        upload_to_s3(file_path)
+
+        return jsonify({'message': 'File ingested successfully'}), 200
+
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+def parse_docx(file_path):
+    doc = Document(file_path)
+    parsed_data = {
+        'business_unit': '',
+        'content': '',
+        'product': '',
+        'target_audience': ''
+    }
+    current_section = None
+    current_content = []
+
+    for para in doc.paragraphs:
+        text = para.text.strip()
+        if "Business Unit" in text:
+            current_section = "business_unit"
+            parsed_data[current_section] = text.replace("Business Unit:", "").strip()
+        elif "Market Input" in text or "Business Problem" in text or "Core Action" in text or "Reasons to believe" in text or "KPI's" in text or "Tactical Requirements" in text:
+            current_section = "content"
+            current_content.append(text)
+        elif "Audience" in text and not parsed_data['product']:
+            current_section = "product"
+            parsed_data[current_section] = text.replace("Audience:", "").strip()
+        elif "Insight" in text and not parsed_data['target_audience']:
+            current_section = "target_audience"
+            parsed_data[current_section] = text.replace("Insight:", "").strip()
+        elif "Business and Marketing Objective" in text and not parsed_data['product']:
+            current_section = "product"
+            parsed_data[current_section] = text.replace("Business and Marketing Objective:", "").strip()
+        elif "Target Audience" in text and not parsed_data['target_audience']:
+            current_section = "target_audience"
+            parsed_data[current_section] = text.replace("Target Audience:", "").strip()
+        elif "Project Summary" in text:
+            current_section = "content"
+            current_content.append(text)
+        elif current_section:
+            if current_section == "content":
+                current_content.append(text)
+            else:
+                parsed_data[current_section] += " " + text
+
+    parsed_data['content'] = " ".join(current_content).replace('\n', ' ').strip()
+
+    return parsed_data
+
+def save_to_postgres(data):
+    conn = psycopg2.connect(**db_config)
+    cur = conn.cursor()
+
+    # Assuming table named 'documents' with columns 'id', 'business_unit', 'content', 'product', 'target_audience'
+    cur.execute("""
+        INSERT INTO documents (business_unit, content, product, target_audience)
+        VALUES (%s, %s, %s, %s)
+        """, (data.get('business_unit', ''), data.get('content', ''), data.get('product', ''), data.get('target_audience', '')))
+
+    conn.commit()
+    cur.close()
+    conn.close()
+
+def upload_to_s3(file_path):
+    filename = os.path.basename(file_path)
+    s3.upload_file(file_path, bucket_name, filename)
+
+if __name__ == '__main__':
+    app.run(debug=True)
